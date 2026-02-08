@@ -8,12 +8,13 @@ SRCS = main.c
 OUTPUT = output
 
 
-all: test $(TARGET)
 
 $(TARGET): $(SRCS)
-	$(CC) -o $(TARGET) $(SRCS) $(CFLAGS) -mwindows
+	$(CC) -o $(TARGET) $(SRCS) $(CFLAGS)
 
-test: clean
+all: test $(TARGET)
+
+test:
 	$(CC) -o $(TAGET_TEST) $(SRCS) $(CFLAGS) -DRUN_TESTS
 
 clean:
