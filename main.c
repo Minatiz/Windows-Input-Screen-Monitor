@@ -536,6 +536,20 @@ BOOL WINAPI ConsoleHandler(DWORD dwType)
     return FALSE;
 }
 
+void DisplayHeader()
+{
+    system("cls");
+    printf("\033[1;32m");
+    printf("======================================================\n");
+    printf("\tWindows Input & Screen Monitor v1.0\n");
+    printf("======================================================\n");
+    printf(" Output: ./%s/\n", OUTPUT_FOLDER);
+    printf(" Interval: %d ms\n", SCREENSHOT_INTERVAL);
+    printf("======================================================\n");
+    printf(" Press Ctrl+C or X in this window to exit safely.\n");
+    printf("======================================================\n\n");
+}
+
 int main()
 {
 
@@ -545,6 +559,7 @@ int main()
     return 0;
 #endif
 
+    DisplayHeader();
     mainThreadId = GetCurrentThreadId();
     cleanupFinished = CreateEvent(NULL, TRUE, FALSE, NULL);
 
